@@ -1,6 +1,7 @@
 import os
 import asyncio
 import logging
+import html
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, Response
@@ -11,7 +12,7 @@ from telegram.ext import (
     Application,
     CommandHandler,
     ContextTypes,
-    CallbackQueryHandler, # Ensure this is here
+    CallbackQueryHandler,
     filters,
 )
 
@@ -31,33 +32,49 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.info(f"User {user.username} ({user.id}) started the bot.")
     
     keyboard = [
-        [InlineKeyboardButton("💰 Deposit (Test)", callback_data="deposit_start_test")],
-        [InlineKeyboardButton("💸 Withdraw", callback_data="withdraw_start")],
+        [InlineKeyboardButton("💰 Deposit (Self-Debugging Test)", callback_data="deposit_start_test")],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     await update.message.reply_html(
-        rf"Hello {user.mention_html()}! This is a test. Please click a button:",
+        rf"Hello {user.mention_html()}! This is a new test. Please click the button:",
         reply_markup=reply_markup
     )
 
 
-# --- NEW DEBUGGING HANDLER ---
+# --- NEW SELF-DEBUGGING HANDLER ---
 async def button_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    A simple handler to see if any button click is registered.
-    This replaces the complex conversation handler for now.
+    This special version will catch any error and report it back to the chat.
     """
     query = update.callback_query
-    await query.answer()  # Acknowledge the click, stops the loading icon
+    await query.answer()
+    logger.info(f"Attempting to process button click with data: {query.data}")
+    
+    try:
+        # The action we want to test
+        await query.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=f"✅ SUCCESS! Button click registered!\nData: '{query.data}'"
+        )
+        logger.info("Successfully sent button click confirmation.")
 
-    logger.info(f"Button click received! Data: {query.data}")
-
-    # Send a NEW message to confirm we received the click
-    await query.bot.send_message(
-        chat_id=update.effective_chat.id,
-        text=f"Button click registered!\nData received: '{query.data}'"
-    )
+    except Exception as e:
+        # If ANY error happens, catch it and report it directly in the chat
+        logger.error(f"An error occurred in button_test: {e}", exc_info=True)
+        
+        # Escape the error message to make it safe for HTML parsing
+        escaped_error = html.escape(str(e))
+        
+        error_message = (
+            f"❌ An error occurred while processing the button click:\n\n"
+            f"<b>Error Details:</b>\n<pre>{escaped_error}</pre>"
+        )
+        await query.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=error_message,
+            parse_mode='HTML'
+        )
 
 
 # --- FastAPI & PTB Application Setup ---
@@ -77,8 +94,6 @@ app = FastAPI(lifespan=lifespan)
 # Build the PTB application and add handlers
 ptb_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 ptb_app.add_handler(CommandHandler("start", start))
-
-# ADDING THE NEW, SIMPLE HANDLER. The ConversationHandler is removed for this test.
 ptb_app.add_handler(CallbackQueryHandler(button_test))
 
 
