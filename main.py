@@ -165,7 +165,6 @@ deposit_conv_handler = ConversationHandler(
 ptb_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 ptb_app.add_handler(CommandHandler("start", start))
 ptb_app.add_handler(deposit_conv_handler)
-# Admin button handlers will be added later
 
 @app.post(f"/webhook/{TELEGRAM_BOT_TOKEN}")
 async def process_telegram_update(request: Request):
@@ -174,3 +173,9 @@ async def process_telegram_update(request: Request):
     update = Update.de_json(json_data, ptb_app.bot)
     await ptb_app.process_update(update)
     return Response(status_code=200)
+
+@app.get("/")
+async def health_check():
+    """Railway's health check endpoint. Responds with 200 OK."""
+    logger.info("Health check endpoint was hit.")
+    return {"status": "ok"}
