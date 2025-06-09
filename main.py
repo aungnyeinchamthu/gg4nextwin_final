@@ -1,7 +1,8 @@
 import os
-import asyncio
 import logging
 import html
+import random
+import string
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, Response
@@ -12,6 +13,8 @@ from telegram.ext import (
     Application,
     CommandHandler,
     ContextTypes,
+    ConversationHandler,
+    MessageHandler,
     CallbackQueryHandler,
     filters,
 )
@@ -23,93 +26,151 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+ADMIN_DEPOSIT_GROUP_ID = os.getenv("ADMIN_DEPOSIT_GROUP_ID")
 
+# --- Conversation States ---
+ASKING_ID, ASKING_AMOUNT, ASKING_SCREENSHOT = range(3)
 
-# --- Telegram Command Handlers ---
+# --- Utility Functions ---
+def generate_request_id(length=6):
+    """Generates a random alphanumeric request ID."""
+    return 'DEP-' + ''.join(random.choices(string.ascii_uppercase + string.digits, k=length))
+
+async def report_error(update: Update, context: ContextTypes.DEFAULT_TYPE, error: Exception):
+    """A helper function to catch errors and report them to the user."""
+    logger.error(f"An error occurred: {error}", exc_info=True)
+    escaped_error = html.escape(str(error))
+    error_message = f"❌ An error occurred:\n\n<pre>{escaped_error}</pre>"
+    
+    if update.callback_query:
+        await update.callback_query.bot.send_message(
+            chat_id=update.effective_chat.id, text=error_message, parse_mode='HTML'
+        )
+    else:
+        await update.message.reply_html(error_message)
+
+# --- Main Handlers ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Sends a message when the command /start is issued."""
+    """Sends a welcome message with a Deposit button."""
     user = update.effective_user
     logger.info(f"User {user.username} ({user.id}) started the bot.")
-    
-    keyboard = [
-        [InlineKeyboardButton("💰 Deposit (Self-Debugging Test)", callback_data="deposit_start_test")],
-    ]
+    keyboard = [[InlineKeyboardButton("💰 Deposit", callback_data="deposit_start")]]
     reply_markup = InlineKeyboardMarkup(keyboard)
-
     await update.message.reply_html(
-        rf"Hello {user.mention_html()}! This is a new test. Please click the button:",
+        rf"Hello {user.mention_html()}! Please choose an option:",
         reply_markup=reply_markup
     )
 
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Cancels and ends the conversation."""
+    await update.message.reply_text("Operation cancelled.")
+    context.user_data.clear()
+    return ConversationHandler.END
 
-# --- NEW SELF-DEBUGGING HANDLER ---
-async def button_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    This special version will catch any error and report it back to the chat.
-    """
-    query = update.callback_query
-    await query.answer()
-    logger.info(f"Attempting to process button click with data: {query.data}")
-    
+# --- Deposit Conversation Handlers ---
+async def deposit_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Starts the deposit conversation."""
     try:
-        # The action we want to test
-        await query.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text=f"✅ SUCCESS! Button click registered!\nData: '{query.data}'"
-        )
-        logger.info("Successfully sent button click confirmation.")
-
+        query = update.callback_query
+        await query.answer()
+        await query.edit_message_text(text="Please enter your 1xBet User ID.")
+        return ASKING_ID
     except Exception as e:
-        # If ANY error happens, catch it and report it directly in the chat
-        logger.error(f"An error occurred in button_test: {e}", exc_info=True)
-        
-        # Escape the error message to make it safe for HTML parsing
-        escaped_error = html.escape(str(e))
-        
-        error_message = (
-            f"❌ An error occurred while processing the button click:\n\n"
-            f"<b>Error Details:</b>\n<pre>{escaped_error}</pre>"
+        await report_error(update, context, e)
+        return ConversationHandler.END
+
+async def receive_xbet_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Receives the 1xBet ID and asks for the amount."""
+    context.user_data['xbet_id'] = update.message.text
+    await update.message.reply_text("Thank you. Please enter the deposit amount (e.g., 10000).")
+    return ASKING_AMOUNT
+
+async def receive_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Receives the amount and asks for the screenshot."""
+    context.user_data['amount'] = update.message.text
+    bank_details = "Bank: KBZ Bank\nAccount Name: U Aung\nAccount Number: 9988776655"
+    await update.message.reply_text(
+        f"Please transfer to:\n\n{bank_details}\n\nThen send a screenshot of the receipt."
+    )
+    return ASKING_SCREENSHOT
+
+async def receive_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Receives the screenshot, forwards it to admins, and ends the conversation."""
+    try:
+        if not update.message.photo:
+            await update.message.reply_text("That is not a photo. Please send a screenshot.")
+            return ASKING_SCREENSHOT
+
+        photo_file = await update.message.photo[-1].get_file()
+        user = update.effective_user
+        xbet_id = context.user_data.get('xbet_id', 'N/A')
+        amount = context.user_data.get('amount', 'N/A')
+        request_id = generate_request_id()
+
+        admin_caption = (
+            f"--- <b>New Deposit Request</b> ---\n"
+            f"<b>Request ID:</b> <code>{request_id}</code>\n"
+            f"<b>User:</b> {user.mention_html()} ({user.id})\n"
+            f"<b>1xBet ID:</b> {xbet_id}\n"
+            f"<b>Amount:</b> {amount} MMK"
         )
-        await query.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text=error_message,
-            parse_mode='HTML'
-        )
+        keyboard = [[InlineKeyboardButton("🔒 Lock & Take", callback_data=f"lock_req:{request_id}")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        if ADMIN_DEPOSIT_GROUP_ID:
+            await context.bot.send_photo(
+                chat_id=ADMIN_DEPOSIT_GROUP_ID,
+                photo=photo_file.file_id,
+                caption=admin_caption,
+                parse_mode='HTML',
+                reply_markup=reply_markup
+            )
+            await update.message.reply_text("Thank you! Your request has been submitted.")
+        else:
+            logger.error("ADMIN_DEPOSIT_GROUP_ID is not set!")
+            await update.message.reply_text("Sorry, there is a system error. Please contact support.")
+
+        context.user_data.clear()
+        return ConversationHandler.END
+    except Exception as e:
+        await report_error(update, context, e)
+        return ConversationHandler.END
 
 
-# --- FastAPI & PTB Application Setup ---
+# --- FastAPI & Application Setup ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Handles startup and shutdown events."""
-    logger.info("Server startup: Initializing bot...")
+    logger.info("Lifespan: Initializing bot...")
     await ptb_app.initialize()
     await ptb_app.start()
     yield
-    logger.info("Server shutdown: Stopping bot...")
+    logger.info("Lifespan: Shutting down bot...")
     await ptb_app.stop()
     await ptb_app.shutdown()
 
 app = FastAPI(lifespan=lifespan)
 
-# Build the PTB application and add handlers
+deposit_conv_handler = ConversationHandler(
+    entry_points=[CallbackQueryHandler(deposit_start, pattern="^deposit_start$")],
+    states={
+        ASKING_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_xbet_id)],
+        ASKING_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_amount)],
+        ASKING_SCREENSHOT: [MessageHandler(filters.PHOTO, receive_screenshot)],
+    },
+    fallbacks=[CommandHandler("cancel", cancel)],
+    per_message=False
+)
+
 ptb_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 ptb_app.add_handler(CommandHandler("start", start))
-ptb_app.add_handler(CallbackQueryHandler(button_test))
+ptb_app.add_handler(deposit_conv_handler)
+# Admin button handlers will be added later
 
-
-# --- Webhook Endpoint ---
 @app.post(f"/webhook/{TELEGRAM_BOT_TOKEN}")
 async def process_telegram_update(request: Request):
     """Processes updates from Telegram."""
-    try:
-        json_data = await request.json()
-        update = Update.de_json(json_data, ptb_app.bot)
-        await ptb_app.process_update(update)
-    except Exception as e:
-        logger.error("Error processing update:", exc_info=True)
+    json_data = await request.json()
+    update = Update.de_json(json_data, ptb_app.bot)
+    await ptb_app.process_update(update)
     return Response(status_code=200)
-
-@app.get("/")
-def health_check():
-    """Confirms the server is running."""
-    return {"status": "ok"}
