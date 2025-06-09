@@ -15,7 +15,7 @@ from telegram.ext import (
     ContextTypes,
     ConversationHandler,
     MessageHandler,
-    CallbackQueryHandler,
+    CallbackQueryHandler,  # <-- CORRECTLY ADDED HERE
     filters,
 )
 
@@ -29,7 +29,6 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ADMIN_DEPOSIT_GROUP_ID = os.getenv("ADMIN_DEPOSIT_GROUP_ID")
 
 # --- Conversation States ---
-# Define constants for the different steps of the conversation
 ASKING_ID, ASKING_AMOUNT, ASKING_SCREENSHOT = range(3)
 
 
@@ -41,19 +40,21 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     
     keyboard = [
         [InlineKeyboardButton("💰 Deposit", callback_data="deposit_start")],
-        [InlineKeyboardButton("💸 Withdraw", callback_data="withdraw_start")], # Placeholder
+        [InlineKeyboardButton("💸 Withdraw", callback_data="withdraw_start")],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
+    # If the user is starting with /start again, we'll send a new message
+    # If they are in a chat already, it's better to avoid editing a message they might not see
     await update.message.reply_html(
         rf"Hello {user.mention_html()}! Welcome. Please choose an option:",
         reply_markup=reply_markup
     )
 
 async def deposit_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Starts the deposit conversation."""
+    """Starts the deposit conversation after a button click."""
     query = update.callback_query
-    await query.answer() # Answer the callback query to remove the "loading" state
+    await query.answer() # Important to answer the callback query
     
     await query.edit_message_text(text="You have started the deposit process.\n\nPlease enter your 1xBet User ID.")
     return ASKING_ID
@@ -67,7 +68,6 @@ async def receive_xbet_id(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 async def receive_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Receives the amount and asks for the screenshot."""
     context.user_data['amount'] = update.message.text
-    # In a real scenario, you would fetch bank details from the database here.
     bank_details = "Bank: KBZ Bank\nAccount Name: U Aung\nAccount Number: 9988776655"
     await update.message.reply_text(
         f"Please transfer the exact amount to the following account:\n\n{bank_details}\n\n"
@@ -87,13 +87,11 @@ async def receive_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     photo_file = await update.message.photo[-1].get_file()
     
-    # Gather all data
     user = update.effective_user
     xbet_id = context.user_data.get('xbet_id')
     amount = context.user_data.get('amount')
     request_id = generate_request_id()
 
-    # Format the message for admins
     admin_caption = (
         f"--- <b>New Deposit Request</b> ---\n"
         f"<b>Request ID:</b> <code>{request_id}</code>\n"
@@ -102,25 +100,26 @@ async def receive_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE)
         f"<b>Amount:</b> {amount} MMK"
     )
 
-    # Create the "Lock & Take" button
     keyboard = [[InlineKeyboardButton("🔒 Lock & Take", callback_data=f"lock_req:{request_id}")]]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
-    # Send to admin group
     if ADMIN_DEPOSIT_GROUP_ID:
-        await context.bot.send_photo(
-            chat_id=ADMIN_DEPOSIT_GROUP_ID,
-            photo=photo_file.file_id,
-            caption=admin_caption,
-            parse_mode='HTML',
-            reply_markup=reply_markup
-        )
-        await update.message.reply_text("Thank you! Your deposit request has been submitted and is being reviewed. We will notify you shortly.")
+        try:
+            await context.bot.send_photo(
+                chat_id=ADMIN_DEPOSIT_GROUP_ID,
+                photo=photo_file.file_id,
+                caption=admin_caption,
+                parse_mode='HTML',
+                reply_markup=reply_markup
+            )
+            await update.message.reply_text("Thank you! Your deposit request has been submitted and is being reviewed. We will notify you shortly.")
+        except Exception as e:
+            logger.error(f"Failed to send message to admin group: {e}")
+            await update.message.reply_text("Sorry, there was a system error sending your request. Please contact support.")
     else:
         logger.error("ADMIN_DEPOSIT_GROUP_ID is not set!")
         await update.message.reply_text("Sorry, there was a system error. Please contact support.")
 
-    # End the conversation
     context.user_data.clear()
     return ConversationHandler.END
 
@@ -136,10 +135,6 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 async def lifespan(app: FastAPI):
     """Handles startup and shutdown events."""
     logger.info("Server startup: Initializing bot...")
-    # Here you could also create DB tables if they don't exist:
-    # from database import engine, Base
-    # async with engine.begin() as conn:
-    #     await conn.run_sync(Base.metadata.create_all)
     await ptb_app.initialize()
     await ptb_app.start()
     yield
@@ -158,6 +153,7 @@ deposit_conv_handler = ConversationHandler(
         ASKING_SCREENSHOT: [MessageHandler(filters.PHOTO, receive_screenshot)],
     },
     fallbacks=[CommandHandler("cancel", cancel)],
+    per_message=False # This makes the conversation flow per-user, not per-message
 )
 
 # Build the PTB application and add handlers
