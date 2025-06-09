@@ -15,6 +15,7 @@ from telegram.ext import (
     ContextTypes,
     ConversationHandler,
     MessageHandler,
+    CallbackQueryHandler,
     filters,
 )
 
@@ -136,6 +137,7 @@ async def lifespan(app: FastAPI):
     """Handles startup and shutdown events."""
     logger.info("Server startup: Initializing bot...")
     # Here you could also create DB tables if they don't exist:
+    # from database import engine, Base
     # async with engine.begin() as conn:
     #     await conn.run_sync(Base.metadata.create_all)
     await ptb_app.initialize()
@@ -147,9 +149,9 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-# Define the ConversationHandler
-conv_handler = ConversationHandler(
-    entry_points=[CommandHandler("deposit", deposit_start), CallbackQueryHandler(deposit_start, pattern="^deposit_start$")],
+# Define the ConversationHandler for the deposit flow
+deposit_conv_handler = ConversationHandler(
+    entry_points=[CallbackQueryHandler(deposit_start, pattern="^deposit_start$")],
     states={
         ASKING_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_xbet_id)],
         ASKING_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_amount)],
@@ -159,10 +161,9 @@ conv_handler = ConversationHandler(
 )
 
 # Build the PTB application and add handlers
-from telegram.ext import CallbackQueryHandler # Add this import
 ptb_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 ptb_app.add_handler(CommandHandler("start", start))
-ptb_app.add_handler(conv_handler)
+ptb_app.add_handler(deposit_conv_handler)
 # We will add a handler for the "Lock" button later
 
 # --- Webhook Endpoint ---
@@ -180,6 +181,4 @@ async def process_telegram_update(request: Request):
 @app.get("/")
 def health_check():
     """Confirms the server is running."""
-    return {"status": "ok"}git add .
-git commit -m "feat: Implement deposit conversation flow"
-git push
+    return {"status": "ok"}
