@@ -7,7 +7,6 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, Response
 import uvicorn
-import json
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -34,9 +33,11 @@ ASKING_ID, ASKING_AMOUNT, ASKING_SCREENSHOT = range(3)
 
 # --- Utility Functions ---
 def generate_request_id(length=6):
+    """Generates a random alphanumeric request ID."""
     return 'DEP-' + ''.join(random.choices(string.ascii_uppercase + string.digits, k=length))
 
 async def report_error(update: Update, context: ContextTypes.DEFAULT_TYPE, error: Exception):
+    """A helper function to catch errors and report them to the user."""
     logger.error(f"An error occurred: {error}", exc_info=True)
     escaped_error = html.escape(str(error))
     error_message = f"❌ An error occurred:\n\n<pre>{escaped_error}</pre>"
@@ -49,6 +50,7 @@ async def report_error(update: Update, context: ContextTypes.DEFAULT_TYPE, error
 
 # --- Main Handlers ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Sends a welcome message with a Deposit button."""
     user = update.effective_user
     logger.info(f"User {user.username} ({user.id}) started the bot.")
     keyboard = [[InlineKeyboardButton("💰 Deposit", callback_data="deposit_start")]]
@@ -59,6 +61,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Cancels and ends the conversation."""
     await update.message.reply_text("Operation cancelled.")
     context.user_data.clear()
     return ConversationHandler.END
@@ -121,6 +124,7 @@ async def receive_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await report_error(update, context, e)
         return ConversationHandler.END
 
+
 # --- FastAPI & Application Setup ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -147,23 +151,11 @@ ptb_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 ptb_app.add_handler(CommandHandler("start", start))
 ptb_app.add_handler(deposit_conv_handler)
 
-# --- SPECIAL WEBHOOK FOR DEBUGGING ---
 @app.post(f"/webhook/{TELEGRAM_BOT_TOKEN}")
 async def process_telegram_update(request: Request):
-    """
-    This special debugging endpoint logs the raw JSON from Telegram.
-    """
-    try:
-        json_data = await request.json()
-        # Log the entire incoming data structure
-        logger.info(f"--- INCOMING WEBHOOK DATA ---\n{json.dumps(json_data, indent=2)}\n-----------------------------")
-        
-        # We still process the update so the bot can function if the data is valid
-        update = Update.de_json(json_data, ptb_app.bot)
-        await ptb_app.process_update(update)
-    except Exception as e:
-        logger.error("Error in webhook processing:", exc_info=True)
-
+    json_data = await request.json()
+    update = Update.de_json(json_data, ptb_app.bot)
+    await ptb_app.process_update(update)
     return Response(status_code=200)
 
 @app.get("/")
