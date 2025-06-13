@@ -316,13 +316,13 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-@post("/webhook")
+@app.post("/webhook")
 async def process_telegram_update(request: Request):
     ptb_app = request.app.state.ptb_app
     update = Update.de_json(await request.json(), ptb_app.bot)
     await ptb_app.process_update(update)
     return Response(status_code=200)
 
-@get("/")
+@app.get("/")
 async def health_check():
     return {"status": "ok", "message": "Full admin workflow active."}
