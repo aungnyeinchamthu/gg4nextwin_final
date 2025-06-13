@@ -43,6 +43,7 @@ ADMIN_DEPOSIT_GROUP_ID = os.getenv("ADMIN_DEPOSIT_GROUP_ID")
 if not DATABASE_URL or not TELEGRAM_BOT_TOKEN or not PUBLIC_URL:
     raise ValueError("One or more critical environment variables are not set!")
 
+
 # --- Conversation States ---
 ASKING_ID, ASKING_AMOUNT, ASKING_SCREENSHOT = range(3)
 
@@ -140,6 +141,49 @@ async def receive_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE)
     return ConversationHandler.END
 
 
+# --- NEW: Admin Action Handler ---
+async def lock_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handles the 'Lock & Take' button click by an admin."""
+    query = update.callback_query
+    await query.answer("Request locked by you.")
+
+    # Extract request_id from callback_data (e.g., "lock_req:DEP-XYZ123")
+    request_id = query.data.split(":")[1]
+    admin = query.from_user
+
+    async with context.bot_data["db_session_factory"]() as session:
+        result = await session.execute(select(Transaction).filter_by(request_id=request_id))
+        transaction = result.scalar_one_or_none()
+
+        if transaction and transaction.status == 'pending':
+            transaction.status = 'locked'
+            transaction.admin_id = admin.id
+            await session.commit()
+            logger.info(f"Transaction {request_id} locked by admin {admin.username} ({admin.id}).")
+
+            # Create new buttons for Approve/Reject
+            keyboard = [
+                [
+                    InlineKeyboardButton("✅ Approve", callback_data=f"approve_req:{request_id}"),
+                    InlineKeyboardButton("❌ Reject", callback_data=f"reject_req:{request_id}")
+                ]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            # Edit the original message caption to show it's locked
+            original_caption = query.message.caption_html
+            new_caption = f"{original_caption}\n\n---\n<b>Status:</b> Locked by {admin.mention_html()}"
+            
+            await query.edit_message_caption(caption=new_caption, parse_mode='HTML', reply_markup=reply_markup)
+        
+        elif transaction:
+            # If another admin already took it
+            await query.answer(f"This request was already handled (Status: {transaction.status}).", show_alert=True)
+        else:
+            await query.answer("Error: Transaction not found in database.", show_alert=True)
+            logger.warning(f"Admin {admin.id} tried to lock non-existent transaction {request_id}")
+
+
 # --- FastAPI & Application Setup ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -150,17 +194,13 @@ async def lifespan(app: FastAPI):
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
-    # Create a session factory that can be used by handlers
     db_session_factory = sessionmaker(
         engine, class_=AsyncSession, expire_on_commit=False
     )
 
     ptb_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-    
-    # Store the session factory in the bot_data for access in handlers
     ptb_app.bot_data["db_session_factory"] = db_session_factory
 
-    # Add handlers
     deposit_conv_handler = ConversationHandler(
         entry_points=[CallbackQueryHandler(deposit_start, pattern="^deposit_start$")],
         states={
@@ -173,6 +213,8 @@ async def lifespan(app: FastAPI):
     )
     ptb_app.add_handler(CommandHandler("start", start))
     ptb_app.add_handler(deposit_conv_handler)
+    # NEW: Add the handler for the admin lock button
+    ptb_app.add_handler(CallbackQueryHandler(lock_request, pattern=r"^lock_req:"))
     
     app.state.ptb_app = ptb_app
 
@@ -187,6 +229,7 @@ async def lifespan(app: FastAPI):
     await ptb_app.shutdown()
 
 app = FastAPI(lifespan=lifespan)
+
 
 # --- Webhook Endpoint ---
 @app.post("/webhook")
