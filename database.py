@@ -2,25 +2,19 @@ import os
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker, declarative_base
 
-# Load the database URL from Railway's environment variables
-DATABASE_URL = os.getenv("DATABASE_URL")
+# --- TEMPORARY DEBUGGING STEP ---
+# PASTE YOUR FULL DATABASE URL FROM RAILWAY INSIDE THE QUOTES BELOW
+DATABASE_URL = "postgresql://postgres:fUvnhBOYsgxpUcOZFELemOekEtSsMAxU@hopper.proxy.rlwy.net:20186/railway"
 
-if not DATABASE_URL:
-    raise ValueError("No DATABASE_URL environment variable set")
 
-# Create the async engine for connecting to the database
+# We are temporarily bypassing the environment variable check to test the connection
+if DATABASE_URL == "postgresql://postgres:fUvnhBOYsgxpUcOZFELemOekEtSsMAxU@hopper.proxy.rlwy.net:20186/railway":
+    raise ValueError("You forgot to paste the Database URL into the database.py file.")
+
 engine = create_async_engine(DATABASE_URL)
 
-# Create a configured "Session" class
-# autocommit=False and autoflush=False are standard for async sessions
 AsyncSessionLocal = sessionmaker(
     engine, class_=AsyncSession, expire_on_commit=False, autocommit=False, autoflush=False
 )
 
-# This is the base class our ORM models will inherit from
 Base = declarative_base()
-
-# Dependency to get a DB session in our application
-async def get_db():
-    async with AsyncSessionLocal() as session:
-        yield session
