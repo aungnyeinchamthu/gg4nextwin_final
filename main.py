@@ -14,7 +14,7 @@ from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker, selectinload
 from sqlalchemy.future import select
 
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatType
 from telegram.ext import (
     Application,
@@ -24,7 +24,6 @@ from telegram.ext import (
     MessageHandler,
     CallbackQueryHandler,
     filters,
-    BaseFilter  # Import BaseFilter
 )
 
 # --- Import our model and base ---
@@ -47,12 +46,6 @@ if not DATABASE_URL or not TELEGRAM_BOT_TOKEN or not PUBLIC_URL:
     raise ValueError("One or more critical environment variables are not set!")
 
 
-# --- NEW: Custom Filter for Private Chats ---
-class PrivateChatFilter(BaseFilter):
-    def filter(self, update: Update) -> bool:
-        return update.message is not None and update.message.chat.type == ChatType.PRIVATE
-
-
 # --- Conversation States ---
 ASKING_ID, ASKING_AMOUNT, ASKING_SCREENSHOT = range(3)
 
@@ -70,7 +63,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not result.scalar_one_or_none():
             session.add(User(user_id=user.id, telegram_username=user.username))
             await session.commit()
-            logger.info(f"New user {user.username} added to database.")
 
     keyboard = [[InlineKeyboardButton("💰 Deposit", callback_data="deposit_start")]]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -222,19 +214,20 @@ async def lifespan(app: FastAPI):
     ptb_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     ptb_app.bot_data["db_session_factory"] = db_session_factory
 
-    # --- UPDATED: Apply the PrivateChatFilter ---
-    private_chat_filter = PrivateChatFilter()
+    # Use the library's built-in filter for private chats
+    private_filter = filters.ChatType.PRIVATE
+
     deposit_conv_handler = ConversationHandler(
         entry_points=[CallbackQueryHandler(deposit_start, pattern="^deposit_start$")],
         states={
-            ASKING_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND & private_chat_filter, receive_xbet_id)],
-            ASKING_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND & private_chat_filter, receive_amount)],
-            ASKING_SCREENSHOT: [MessageHandler(filters.PHOTO & private_chat_filter, receive_screenshot)],
+            ASKING_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND & private_filter, receive_xbet_id)],
+            ASKING_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND & private_filter, receive_amount)],
+            ASKING_SCREENSHOT: [MessageHandler(filters.PHOTO & private_filter, receive_screenshot)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
         per_message=False
     )
-    ptb_app.add_handler(CommandHandler("start", start, filters=private_chat_filter))
+    ptb_app.add_handler(CommandHandler("start", start, filters=private_filter))
     ptb_app.add_handler(deposit_conv_handler)
     ptb_app.add_handler(CallbackQueryHandler(lock_request, pattern=r"^lock_req:"))
     ptb_app.add_handler(CallbackQueryHandler(approve_request, pattern=r"^approve_req:"))
