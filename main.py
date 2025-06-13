@@ -50,18 +50,21 @@ if not DATABASE_URL or not TELEGRAM_BOT_TOKEN or not PUBLIC_URL:
 ASKING_ID, ASKING_AMOUNT, ASKING_SCREENSHOT = range(3)
 
 
-# --- Utility & Helper Functions ---
+# --- Utility Functions ---
 def generate_request_id(prefix='DEP-', length=6):
     return prefix + ''.join(random.choices(string.ascii_uppercase + string.digits, k=length))
 
+
+# --- THIS IS THE NEW, UPGRADED FINALIZER FUNCTION ---
 async def finalize_submission(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """This function finalizes both new and updated submissions."""
     user = update.effective_user
     photo_id = context.user_data.get('photo_id')
     xbet_id = context.user_data.get('xbet_id')
     amount = context.user_data.get('amount')
-    
+
     async with context.bot_data["db_session_factory"]() as session:
+        # For updates, find the existing transaction. For new, create one.
         if context.user_data.get('mode') == 'update':
             request_id = context.user_data.get('request_id')
             result = await session.execute(select(Transaction).filter_by(request_id=request_id))
@@ -81,27 +84,52 @@ async def finalize_submission(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
             session.add(transaction)
             logger.info(f"Saving new transaction {request_id}")
+        
         await session.commit()
+        await session.refresh(transaction) # Refresh to get latest data
 
+    # Prepare the message content
     admin_caption = (
-        f"--- <b>New/Updated Deposit Request</b> ---\n"
+        f"--- <b>Resubmitted Deposit Request</b> ---\n" if context.user_data.get('mode') == 'update' else f"--- <b>New Deposit Request</b> ---\n"
+    )
+    admin_caption += (
         f"<b>Request ID:</b> <code>{request_id}</code>\n<b>User:</b> {user.mention_html()} ({user.id})\n"
         f"<b>1xBet ID:</b> {transaction.xbet_id_from_user}\n<b>Amount:</b> {transaction.amount} MMK"
     )
     keyboard = [[InlineKeyboardButton("🔒 Lock & Take", callback_data=f"lock_req:{request_id}")]]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
-    if ADMIN_DEPOSIT_GROUP_ID:
-        admin_message = await context.bot.send_photo(
-            chat_id=ADMIN_DEPOSIT_GROUP_ID, photo=photo_id,
-            caption=admin_caption, parse_mode='HTML', reply_markup=reply_markup
-        )
-        async with context.bot_data["db_session_factory"]() as session:
-            result = await session.execute(select(Transaction).filter_by(request_id=request_id))
-            transaction_to_update = result.scalar_one_or_none()
-            if transaction_to_update:
-                transaction_to_update.admin_chat_id = admin_message.chat_id
-                transaction_to_update.admin_message_id = admin_message.message_id
+    # --- THIS IS THE NEW LOGIC YOU SUGGESTED ---
+    # If this is an update AND we know where the original admin message is, EDIT it.
+    if context.user_data.get('mode') == 'update' and transaction.admin_chat_id and transaction.admin_message_id:
+        try:
+            await context.bot.edit_message_caption(
+                chat_id=transaction.admin_chat_id,
+                message_id=transaction.admin_message_id,
+                caption=admin_caption,
+                parse_mode='HTML',
+                reply_markup=reply_markup,
+            )
+            logger.info(f"Edited admin message for resubmitted request {request_id}")
+        except Exception as e:
+            logger.error(f"Could not edit admin message for {request_id}, sending new one. Error: {e}")
+            # Fallback to sending a new message if editing fails
+            await context.bot.send_photo(
+                chat_id=ADMIN_DEPOSIT_GROUP_ID, photo=transaction.photo_file_id,
+                caption=admin_caption, parse_mode='HTML', reply_markup=reply_markup
+            )
+    # Otherwise (for all new requests), send a new photo message.
+    else:
+        if ADMIN_DEPOSIT_GROUP_ID:
+            admin_message = await context.bot.send_photo(
+                chat_id=ADMIN_DEPOSIT_GROUP_ID, photo=transaction.photo_file_id,
+                caption=admin_caption, parse_mode='HTML', reply_markup=reply_markup
+            )
+            # Save the new message details to the transaction for future edits
+            async with context.bot_data["db_session_factory"]() as session:
+                transaction.admin_chat_id = admin_message.chat_id
+                transaction.admin_message_id = admin_message.message_id
+                session.add(transaction)
                 await session.commit()
 
     await context.bot.send_message(chat_id=user.id, text="Thank you! Your request has been submitted and is being reviewed.")
@@ -109,7 +137,9 @@ async def finalize_submission(update: Update, context: ContextTypes.DEFAULT_TYPE
     return ConversationHandler.END
 
 
-# --- Main Handlers ---
+# --- All other handlers (start, cancel, deposit_start, receive_id, etc.) remain the same ---
+# (I am including the full code below for you to copy and paste)
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     async with context.bot_data["db_session_factory"]() as session:
@@ -124,8 +154,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text("Operation cancelled."); context.user_data.clear(); return ConversationHandler.END
 
-
-# --- Deposit Conversation Handlers ---
 async def deposit_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query; await query.answer()
     context.user_data.clear(); context.user_data['mode'] = 'new'
@@ -145,18 +173,11 @@ async def receive_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await update.message.reply_text(f"Please transfer to:\n\n{bank_details}\n\nThen send a screenshot."); return ASKING_SCREENSHOT
 
 async def receive_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Smarter handler for receiving the screenshot."""
     if not update.message.photo:
         await update.message.reply_text("That is not a photo. Please send a screenshot."); return ASKING_SCREENSHOT
-    
     context.user_data['photo_id'] = update.message.photo[-1].file_id
-    
-    # If this is an update or a new submission, we finalize it.
-    # This correctly handles the "Wrong Slip" resubmission case.
     return await finalize_submission(update, context)
 
-
-# --- Admin Action Handlers ---
 async def lock_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query; request_id = query.data.split(":")[1]; admin = query.from_user
     async with context.bot_data["db_session_factory"]() as session:
@@ -228,6 +249,7 @@ async def request_resubmission(update: Update, context: ContextTypes.DEFAULT_TYP
 # --- FastAPI & Application Setup ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # (code remains the same)
     ASYNC_DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://")
     engine = create_async_engine(ASYNC_DATABASE_URL)
     async with engine.begin() as conn: await conn.run_sync(Base.metadata.create_all)
@@ -235,10 +257,7 @@ async def lifespan(app: FastAPI):
     ptb_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     ptb_app.bot_data["db_session_factory"] = db_session_factory
     deposit_conv_handler = ConversationHandler(
-        entry_points=[
-            CallbackQueryHandler(deposit_start, pattern="^deposit_start$"),
-            CallbackQueryHandler(request_resubmission, pattern=r"^resubmit:"),
-        ],
+        entry_points=[CallbackQueryHandler(deposit_start, pattern="^deposit_start$"), CallbackQueryHandler(request_resubmission, pattern=r"^resubmit:")],
         states={
             ASKING_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, receive_xbet_id)],
             ASKING_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, receive_amount)],
