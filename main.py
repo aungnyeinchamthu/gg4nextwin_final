@@ -57,92 +57,75 @@ def generate_request_id(prefix='DEP-', length=6):
 
 # --- THIS IS THE NEW, CORRECTED FINALIZER FUNCTION ---
 async def finalize_submission(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """This function finalizes both new and updated submissions."""
     user = update.effective_user
     photo_id = context.user_data.get('photo_id')
     xbet_id = context.user_data.get('xbet_id')
     amount = context.user_data.get('amount')
+    
+    async with context.bot_data["db_session_factory"]() as session:
+        try:
+            if context.user_data.get('mode') == 'update':
+                # Handle resubmission
+                original_request_id = context.user_data.get('original_request_id')
+                result = await session.execute(
+                    select(Transaction).filter_by(request_id=original_request_id)
+                )
+                transaction = result.scalar_one_or_none()
+                if transaction:
+                    transaction.status = "PENDING"
+                    transaction.xbet_id_from_user = xbet_id or transaction.xbet_id_from_user
+                    transaction.amount = amount or transaction.amount
+                    transaction.photo_id = photo_id or transaction.photo_id
+                    transaction.updated_at = datetime.utcnow()
+            else:
+                # Handle new submission
+                transaction = Transaction(
+                    request_id=generate_request_id(),
+                    user_id=user.id,
+                    xbet_id_from_user=xbet_id,
+                    amount=amount,
+                    photo_id=photo_id,
+                    status="PENDING"
+                )
+                session.add(transaction)
+            
+            await session.commit()
+            await session.refresh(transaction)
 
-    # Get a database session
-    session = context.bot_data["db_session_factory"]()
-
-    try:
-        # For updates, find and update the existing transaction. For new, create one.
-        if context.user_data.get('mode') == 'update':
-            request_id = context.user_data.get('request_id')
-            result = await session.execute(select(Transaction).filter_by(request_id=request_id))
-            transaction = result.scalar_one_or_none()
-            if transaction:
-                transaction.status = 'pending'
-                if xbet_id: transaction.xbet_id_from_user = xbet_id
-                if amount: transaction.amount = float(amount)
-                if photo_id: transaction.photo_file_id = photo_id
-                logger.info(f"Updating transaction {request_id}")
-        else:  # New submission
-            request_id = generate_request_id()
-            transaction = Transaction(
-                user_id=user.id, request_id=request_id, type='DEPOSIT',
-                amount=float(amount if amount else 0), status='pending',
-                xbet_id_from_user=xbet_id, photo_file_id=photo_id
+            # Send to admin group
+            keyboard = [
+                [
+                    InlineKeyboardButton("🔒 Lock", callback_data=f"lock:{transaction.request_id}"),
+                    InlineKeyboardButton("✅ Approve", callback_data=f"approve:{transaction.request_id}"),
+                    InlineKeyboardButton("❌ Reject", callback_data=f"reject:{transaction.request_id}")
+                ]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await context.bot.send_photo(
+                chat_id=ADMIN_DEPOSIT_GROUP_ID,
+                photo=photo_id,
+                caption=f"{'🔄 Resubmitted' if context.user_data.get('mode') == 'update' else '🆕 New'} Deposit Request\n"
+                       f"Request ID: {transaction.request_id}\n"
+                       f"User: {user.full_name}\n"
+                       f"1xBet ID: {xbet_id}\n"
+                       f"Amount: {amount}",
+                reply_markup=reply_markup
             )
-            session.add(transaction)
-            logger.info(f"Saving new transaction {request_id}")
-        
-        await session.commit()
-        await session.refresh(transaction)
 
-        # Prepare the message content
-        caption_title = "--- <b>Resubmitted Deposit Request</b> ---\n" if context.user_data.get('mode') == 'update' else "--- <b>New Deposit Request</b> ---\n"
-        admin_caption = (
-            caption_title +
-            f"<b>Request ID:</b> <code>{request_id}</code>\n<b>User:</b> {user.mention_html()} ({user.id})\n"
-            f"<b>1xBet ID:</b> {transaction.xbet_id_from_user}\n<b>Amount:</b> {transaction.amount} MMK"
-        )
-        keyboard = [[InlineKeyboardButton("🔒 Lock & Take", callback_data=f"lock_req:{request_id}")]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
+            await update.message.reply_text(
+                "Your deposit request has been submitted. Please wait for confirmation."
+            )
+            
+            context.user_data.clear()
+            return ConversationHandler.END
 
-        # If this is an update and we know where the original admin message is, EDIT it.
-        if context.user_data.get('mode') == 'update' and transaction.admin_chat_id and transaction.admin_message_id:
-            try:
-                # For a resubmission, we need to send a new photo with the updated caption
-                # because Telegram API does not allow editing a photo, only the caption.
-                # So we delete the old message and send a new one.
-                await context.bot.delete_message(chat_id=transaction.admin_chat_id, message_id=transaction.admin_message_id)
-                logger.info(f"Deleted old admin message for {request_id}")
-
-                admin_message = await context.bot.send_photo(
-                    chat_id=ADMIN_DEPOSIT_GROUP_ID, photo=transaction.photo_file_id,
-                    caption=admin_caption, parse_mode='HTML', reply_markup=reply_markup
-                )
-                transaction.admin_message_id = admin_message.message_id
-                logger.info(f"Sent new admin message for resubmitted request {request_id}")
-
-            except Exception as e:
-                logger.error(f"Could not edit/delete old message for {request_id}, sending new one. Error: {e}")
-                admin_message = await context.bot.send_photo(
-                    chat_id=ADMIN_DEPOSIT_GROUP_ID, photo=transaction.photo_file_id,
-                    caption=admin_caption, parse_mode='HTML', reply_markup=reply_markup
-                )
-                transaction.admin_chat_id = admin_message.chat_id
-                transaction.admin_message_id = admin_message.message_id
-        
-        # Otherwise (for all new requests), send a new photo message.
-        else:
-            if ADMIN_DEPOSIT_GROUP_ID:
-                admin_message = await context.bot.send_photo(
-                    chat_id=ADMIN_DEPOSIT_GROUP_ID, photo=transaction.photo_file_id,
-                    caption=admin_caption, parse_mode='HTML', reply_markup=reply_markup
-                )
-                transaction.admin_chat_id = admin_message.chat_id
-                transaction.admin_message_id = admin_message.message_id
-
-        await session.commit()
-        await context.bot.send_message(chat_id=user.id, text="Thank you! Your request has been submitted and is being reviewed.")
-
-    finally:
-        await session.close()
-        context.user_data.clear()
-        return ConversationHandler.END
+        except Exception as e:
+            logger.error(f"Error in finalize_submission: {e}")
+            await update.message.reply_text(
+                "Sorry, there was an error processing your request. Please try again."
+            )
+            return ConversationHandler.END
 
 
 # --- All other handlers and setup code remain the same ---
@@ -233,46 +216,66 @@ async def reject_request_options(update: Update, context: ContextTypes.DEFAULT_T
     await query.edit_message_reply_markup(reply_markup=reply_markup)
 
 async def request_resubmission(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query; await query.answer()
+    query = update.callback_query
+    await query.answer()
     _, reason_code, request_id = query.data.split(":")
     admin = query.from_user
-    reasons = {"wrong_id": "Wrong 1xBet ID", "wrong_amount": "Wrong Amount", "wrong_slip": "Wrong/Unclear Screenshot"}
+    reasons = {
+        "wrong_id": "Wrong 1xBet ID",
+        "wrong_amount": "Wrong Amount", 
+        "wrong_slip": "Wrong/Unclear Screenshot"
+    }
     reason_text = reasons.get(reason_code, "Unknown")
+
     async with context.bot_data["db_session_factory"]() as session:
-        result = await session.execute(select(Transaction).filter_by(request_id=request_id))
+        # Get the transaction and user
+        result = await session.execute(
+            select(Transaction).filter_by(request_id=request_id)
+            .options(selectinload(Transaction.user))
+        )
         transaction = result.scalar_one_or_none()
-        if not transaction: await query.answer("Txn not found.", show_alert=True); return ConversationHandler.END
         
-        # We must delete the old message because we can't edit a photo, only the caption.
-        # Deleting and sending a new one is the cleanest user experience.
-        try:
-            await context.bot.delete_message(chat_id=transaction.admin_chat_id, message_id=transaction.admin_message_id)
-        except Exception as e:
-            logger.warning(f"Could not delete old admin message {transaction.admin_message_id}. Error: {e}")
-        
-        await context.bot.send_message(
-            chat_id=transaction.admin_chat_id,
-            text=f"Request <code>{request_id}</code> was returned to user by {admin.mention_html()} for correction.\n<b>Reason:</b> {reason_text}",
-            parse_mode='HTML'
+        if not transaction:
+            await query.edit_message_text("Error: Transaction not found")
+            return ConversationHandler.END
+
+        # Update transaction status
+        transaction.status = "REJECTED"
+        transaction.admin_id = admin.id
+        transaction.rejection_reason = reason_text
+        await session.commit()
+
+        # Setup resubmission context
+        context.user_data.clear()
+        context.user_data['mode'] = 'update'
+        context.user_data['original_request_id'] = request_id
+
+        # Notify admin group about rejection
+        admin_message = (
+            f"🚫 Request {request_id} REJECTED\n"
+            f"Reason: {reason_text}\n"
+            f"By admin: {admin.full_name}"
+        )
+        await context.bot.edit_message_text(
+            chat_id=ADMIN_DEPOSIT_GROUP_ID,
+            message_id=query.message.message_id,
+            text=admin_message
         )
 
-        context.user_data.clear(); context.user_data['mode'] = 'update'; context.user_data['request_id'] = request_id
-        if reason_code != 'wrong_id': context.user_data['xbet_id'] = transaction.xbet_id_from_user
-        if reason_code != 'wrong_amount': context.user_data['amount'] = transaction.amount
-        if reason_code != 'wrong_slip': context.user_data['photo_id'] = transaction.photo_file_id
-        
-        prompt_text = f"Your deposit was returned.\n<b>Reason:</b> {reason_text}.\nPlease submit the correct "
-        next_state = ConversationHandler.END
-        if reason_code == 'wrong_id':
-            prompt_text += "1xBet ID."; next_state = ASKING_ID
-        elif reason_code == 'wrong_amount':
-            prompt_text += "amount."; next_state = ASKING_AMOUNT
-        elif reason_code == 'wrong_slip':
-            prompt_text += "screenshot."; next_state = ASKING_SCREENSHOT
-        
-        await context.bot.send_message(chat_id=transaction.user_id, text=prompt_text, parse_mode='HTML')
-        return next_state
-
+        # Message the user and start resubmission flow
+        user_message = f"Your deposit request was rejected.\nReason: {reason_text}\n\n"
+        if reason_code == "wrong_id":
+            user_message += "Please enter your correct 1xBet ID:"
+            await context.bot.send_message(chat_id=transaction.user.telegram_id, text=user_message)
+            return ASKING_ID
+        elif reason_code == "wrong_amount":
+            user_message += "Please enter the correct deposit amount:"
+            await context.bot.send_message(chat_id=transaction.user.telegram_id, text=user_message)
+            return ASKING_AMOUNT
+        else:  # wrong_slip
+            user_message += "Please send a clear screenshot of your transaction:"
+            await context.bot.send_message(chat_id=transaction.user.telegram_id, text=user_message)
+            return ASKING_SCREENSHOT
 # --- FastAPI & Application Setup ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
