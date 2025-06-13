@@ -21,14 +21,13 @@ class Transaction(Base):
     amount = Column(Numeric(15, 2), nullable=False)
     status = Column(String(50), nullable=False, server_default='pending')
     admin_id = Column(BigInteger, nullable=True)
-    rejection_reason = Column(Text, nullable=True)
     admin_chat_id = Column(BigInteger, nullable=True)
     admin_message_id = Column(Integer, nullable=True)
-    
-    # --- NEW FIELD ---
     xbet_id_from_user = Column(String(255), nullable=True)
+    
+    # --- NEW FIELD TO STORE THE SCREENSHOT ID ---
+    photo_file_id = Column(String(255), nullable=True)
     
     created_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=text('now()'))
     updated_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=text('now()'))
     user = relationship("User", back_populates="transactions")
-    
