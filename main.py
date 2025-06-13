@@ -30,10 +30,13 @@ from telegram.ext import (
 from database import Base
 from models import User, Transaction
 
-# --- Basic Setup & Environment Variables ---
-logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
+# --- Basic Setup ---
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+)
 logger = logging.getLogger(__name__)
 
+# --- Load Environment Variables ---
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 PUBLIC_URL = os.getenv("PUBLIC_URL")
@@ -41,6 +44,7 @@ ADMIN_DEPOSIT_GROUP_ID = os.getenv("ADMIN_DEPOSIT_GROUP_ID")
 
 if not DATABASE_URL or not TELEGRAM_BOT_TOKEN or not PUBLIC_URL:
     raise ValueError("One or more critical environment variables are not set!")
+
 
 # --- Conversation States ---
 ASKING_ID, ASKING_AMOUNT, ASKING_SCREENSHOT = range(3)
@@ -51,12 +55,12 @@ def generate_request_id(prefix='DEP-', length=6):
     return prefix + ''.join(random.choices(string.ascii_uppercase + string.digits, k=length))
 
 async def finalize_submission(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """This new function finalizes both new and updated submissions."""
+    """This function finalizes both new and updated submissions."""
     user = update.effective_user
     photo_id = context.user_data.get('photo_id')
     xbet_id = context.user_data.get('xbet_id')
     amount = context.user_data.get('amount')
-
+    
     async with context.bot_data["db_session_factory"]() as session:
         if context.user_data.get('mode') == 'update':
             request_id = context.user_data.get('request_id')
@@ -94,10 +98,10 @@ async def finalize_submission(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         async with context.bot_data["db_session_factory"]() as session:
             result = await session.execute(select(Transaction).filter_by(request_id=request_id))
-            tx_to_update = result.scalar_one_or_none()
-            if tx_to_update:
-                tx_to_update.admin_chat_id = admin_message.chat_id
-                tx_to_update.admin_message_id = admin_message.message_id
+            transaction_to_update = result.scalar_one_or_none()
+            if transaction_to_update:
+                transaction_to_update.admin_chat_id = admin_message.chat_id
+                transaction_to_update.admin_message_id = admin_message.message_id
                 await session.commit()
 
     await context.bot.send_message(chat_id=user.id, text="Thank you! Your request has been submitted and is being reviewed.")
@@ -107,7 +111,6 @@ async def finalize_submission(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 # --- Main Handlers ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # ... (code remains the same)
     user = update.effective_user
     async with context.bot_data["db_session_factory"]() as session:
         result = await session.execute(select(User).filter_by(user_id=user.id))
@@ -131,25 +134,30 @@ async def deposit_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 async def receive_xbet_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data['xbet_id'] = update.message.text
     if context.user_data.get('mode') == 'update':
-        return await finalize_submission(update, context) # Go straight to finalizer
+        return await finalize_submission(update, context)
     await update.message.reply_text("Thank you. Please enter the deposit amount."); return ASKING_AMOUNT
 
 async def receive_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data['amount'] = update.message.text
     if context.user_data.get('mode') == 'update':
-        return await finalize_submission(update, context) # Go straight to finalizer
+        return await finalize_submission(update, context)
     bank_details = "Bank: KBZ Bank\nAccount Name: U Aung\nAccount Number: 9988776655"
     await update.message.reply_text(f"Please transfer to:\n\n{bank_details}\n\nThen send a screenshot."); return ASKING_SCREENSHOT
 
 async def receive_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Smarter handler for receiving the screenshot."""
     if not update.message.photo:
         await update.message.reply_text("That is not a photo. Please send a screenshot."); return ASKING_SCREENSHOT
+    
     context.user_data['photo_id'] = update.message.photo[-1].file_id
+    
+    # If this is an update or a new submission, we finalize it.
+    # This correctly handles the "Wrong Slip" resubmission case.
     return await finalize_submission(update, context)
 
 
 # --- Admin Action Handlers ---
-async def lock_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None: # (code remains the same)
+async def lock_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query; request_id = query.data.split(":")[1]; admin = query.from_user
     async with context.bot_data["db_session_factory"]() as session:
         result = await session.execute(select(Transaction).filter_by(request_id=request_id))
@@ -161,7 +169,7 @@ async def lock_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             await query.edit_message_caption(caption=new_caption, parse_mode='HTML', reply_markup=reply_markup)
         else: await query.answer("Already handled.", show_alert=True)
 
-async def approve_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None: # (code remains the same)
+async def approve_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query; request_id = query.data.split(":")[1]; admin = query.from_user
     async with context.bot_data["db_session_factory"]() as session:
         result = await session.execute(select(Transaction).filter_by(request_id=request_id))
@@ -174,7 +182,7 @@ async def approve_request(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await query.edit_message_caption(caption=new_caption, parse_mode='HTML', reply_markup=None)
         else: await query.answer("Cannot approve.", show_alert=True)
 
-async def reject_request_options(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None: # (code remains the same)
+async def reject_request_options(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query; request_id = query.data.split(":")[1]; admin_id = query.from_user.id
     async with context.bot_data["db_session_factory"]() as session:
         result = await session.execute(select(Transaction).filter_by(request_id=request_id))
@@ -200,7 +208,6 @@ async def request_resubmission(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.edit_message_caption(caption=new_caption, parse_mode='HTML', reply_markup=None)
         context.user_data.clear(); context.user_data['mode'] = 'update'; context.user_data['request_id'] = request_id
         
-        # Pre-fill data using the reliable database record
         if reason_code != 'wrong_id': context.user_data['xbet_id'] = transaction.xbet_id_from_user
         if reason_code != 'wrong_amount': context.user_data['amount'] = transaction.amount
         if reason_code != 'wrong_slip': context.user_data['photo_id'] = transaction.photo_file_id
@@ -220,7 +227,7 @@ async def request_resubmission(update: Update, context: ContextTypes.DEFAULT_TYP
 
 # --- FastAPI & Application Setup ---
 @asynccontextmanager
-async def lifespan(app: FastAPI): # (code remains the same)
+async def lifespan(app: FastAPI):
     ASYNC_DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://")
     engine = create_async_engine(ASYNC_DATABASE_URL)
     async with engine.begin() as conn: await conn.run_sync(Base.metadata.create_all)
@@ -228,7 +235,10 @@ async def lifespan(app: FastAPI): # (code remains the same)
     ptb_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     ptb_app.bot_data["db_session_factory"] = db_session_factory
     deposit_conv_handler = ConversationHandler(
-        entry_points=[CallbackQueryHandler(deposit_start, pattern="^deposit_start$"), CallbackQueryHandler(request_resubmission, pattern=r"^resubmit:")],
+        entry_points=[
+            CallbackQueryHandler(deposit_start, pattern="^deposit_start$"),
+            CallbackQueryHandler(request_resubmission, pattern=r"^resubmit:"),
+        ],
         states={
             ASKING_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, receive_xbet_id)],
             ASKING_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, receive_amount)],
