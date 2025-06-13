@@ -1,5 +1,6 @@
 import os
 import logging
+import html
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, Response
@@ -23,8 +24,8 @@ logger = logging.getLogger(__name__)
 
 # --- Load Environment Variables ---
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-# For this final test, we are hardcoding the URL. Remember to secure this later.
-DATABASE_URL = "postgresql://postgres:fUvnhBOYsgxpUcOZFELemOekEtSsMAxU@hopper.proxy.rlwy.net:20186/railway"
+DATABASE_URL = os.getenv("DATABASE_URL") # This should now be set in Railway
+PUBLIC_URL = os.getenv("PUBLIC_URL")
 
 
 # --- A Simple Start Handler ---
@@ -40,8 +41,15 @@ async def lifespan(app: FastAPI):
     Handles startup and shutdown events.
     This new version creates the DB engine after the app is ready.
     """
+    if not DATABASE_URL or not TELEGRAM_BOT_TOKEN or not PUBLIC_URL:
+        logger.critical("CRITICAL ERROR: One or more environment variables are not set!")
+        return
+
+    # THE CRITICAL FIX IS HERE: Change postgresql:// to postgresql+asyncpg://
+    ASYNC_DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://")
+    
     # Create DB engine and tables
-    engine = create_async_engine(DATABASE_URL)
+    engine = create_async_engine(ASYNC_DATABASE_URL)
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     
@@ -53,7 +61,7 @@ async def lifespan(app: FastAPI):
     app.state.ptb_app = ptb_app
 
     # Set the webhook
-    webhook_url = f"https://{os.getenv('PUBLIC_URL')}/webhook"
+    webhook_url = f"https://{PUBLIC_URL}/webhook"
     await ptb_app.bot.set_webhook(url=webhook_url, allowed_updates=Update.ALL_TYPES)
     
     await ptb_app.start()
