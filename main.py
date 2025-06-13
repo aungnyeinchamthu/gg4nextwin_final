@@ -14,7 +14,8 @@ from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker, selectinload
 from sqlalchemy.future import select
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update
+from telegram.constants import ChatType
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -23,6 +24,7 @@ from telegram.ext import (
     MessageHandler,
     CallbackQueryHandler,
     filters,
+    BaseFilter  # Import BaseFilter
 )
 
 # --- Import our model and base ---
@@ -43,6 +45,12 @@ ADMIN_DEPOSIT_GROUP_ID = os.getenv("ADMIN_DEPOSIT_GROUP_ID")
 
 if not DATABASE_URL or not TELEGRAM_BOT_TOKEN or not PUBLIC_URL:
     raise ValueError("One or more critical environment variables are not set!")
+
+
+# --- NEW: Custom Filter for Private Chats ---
+class PrivateChatFilter(BaseFilter):
+    def filter(self, update: Update) -> bool:
+        return update.message is not None and update.message.chat.type == ChatType.PRIVATE
 
 
 # --- Conversation States ---
@@ -158,62 +166,46 @@ async def lock_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             await query.answer("This request was already handled.", show_alert=True)
 
 async def approve_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handles the 'Approve' button click."""
     query = update.callback_query
     request_id = query.data.split(":")[1]
     admin = query.from_user
-
     async with context.bot_data["db_session_factory"]() as session:
-        # Use selectinload to fetch the related user at the same time
         result = await session.execute(
             select(Transaction).options(selectinload(Transaction.user)).filter_by(request_id=request_id)
         )
         transaction = result.scalar_one_or_none()
-
         if transaction and transaction.status == 'locked' and transaction.admin_id == admin.id:
             await query.answer("Request Approved.")
             transaction.status = 'approved'
-            # Here you would add logic to calculate and add points to transaction.user
             await session.commit()
-
-            # Notify the user
             await context.bot.send_message(
                 chat_id=transaction.user_id,
                 text=f"✅ Your deposit request (ID: {request_id}) for {transaction.amount} MMK has been approved."
             )
-            
-            # Update the admin message to its final state
             original_caption = re.sub(r'\n\n---\n.*', '', query.message.caption_html, flags=re.DOTALL)
             new_caption = f"{original_caption}\n\n---\n<b>Status:</b> ✅ Approved by {admin.mention_html()}"
-            await query.edit_message_caption(caption=new_caption, parse_mode='HTML', reply_markup=None) # No more buttons
+            await query.edit_message_caption(caption=new_caption, parse_mode='HTML', reply_markup=None)
         else:
             await query.answer("You cannot approve this request.", show_alert=True)
 
 async def reject_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handles the 'Reject' button click."""
     query = update.callback_query
     request_id = query.data.split(":")[1]
     admin = query.from_user
-    
     async with context.bot_data["db_session_factory"]() as session:
         result = await session.execute(select(Transaction).filter_by(request_id=request_id))
         transaction = result.scalar_one_or_none()
-
         if transaction and transaction.status == 'locked' and transaction.admin_id == admin.id:
             await query.answer("Request Rejected.")
             transaction.status = 'rejected'
             await session.commit()
-
-            # Notify the user
             await context.bot.send_message(
                 chat_id=transaction.user_id,
                 text=f"❌ Your deposit request (ID: {request_id}) for {transaction.amount} MMK has been rejected. Please contact support."
             )
-            
-            # Update the admin message to its final state
             original_caption = re.sub(r'\n\n---\n.*', '', query.message.caption_html, flags=re.DOTALL)
             new_caption = f"{original_caption}\n\n---\n<b>Status:</b> ❌ Rejected by {admin.mention_html()}"
-            await query.edit_message_caption(caption=new_caption, parse_mode='HTML', reply_markup=None) # No more buttons
+            await query.edit_message_caption(caption=new_caption, parse_mode='HTML', reply_markup=None)
         else:
             await query.answer("You cannot reject this request.", show_alert=True)
 
@@ -221,51 +213,43 @@ async def reject_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 # --- FastAPI & Application Setup ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Handles application startup and shutdown."""
     ASYNC_DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://")
     engine = create_async_engine(ASYNC_DATABASE_URL)
-    
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-
-    db_session_factory = sessionmaker(
-        engine, class_=AsyncSession, expire_on_commit=False
-    )
-
+    db_session_factory = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    
     ptb_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     ptb_app.bot_data["db_session_factory"] = db_session_factory
 
+    # --- UPDATED: Apply the PrivateChatFilter ---
+    private_chat_filter = PrivateChatFilter()
     deposit_conv_handler = ConversationHandler(
         entry_points=[CallbackQueryHandler(deposit_start, pattern="^deposit_start$")],
         states={
-            ASKING_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_xbet_id)],
-            ASKING_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_amount)],
-            ASKING_SCREENSHOT: [MessageHandler(filters.PHOTO, receive_screenshot)],
+            ASKING_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND & private_chat_filter, receive_xbet_id)],
+            ASKING_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND & private_chat_filter, receive_amount)],
+            ASKING_SCREENSHOT: [MessageHandler(filters.PHOTO & private_chat_filter, receive_screenshot)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
         per_message=False
     )
-    ptb_app.add_handler(CommandHandler("start", start))
+    ptb_app.add_handler(CommandHandler("start", start, filters=private_chat_filter))
     ptb_app.add_handler(deposit_conv_handler)
-    # Add all admin action handlers
     ptb_app.add_handler(CallbackQueryHandler(lock_request, pattern=r"^lock_req:"))
     ptb_app.add_handler(CallbackQueryHandler(approve_request, pattern=r"^approve_req:"))
     ptb_app.add_handler(CallbackQueryHandler(reject_request, pattern=r"^reject_req:"))
     
     app.state.ptb_app = ptb_app
-
     await ptb_app.initialize()
     webhook_url = f"https://{PUBLIC_URL}/webhook"
     await ptb_app.bot.set_webhook(url=webhook_url, allowed_updates=Update.ALL_TYPES)
     await ptb_app.start()
-    
     yield
-    
     await ptb_app.stop()
     await ptb_app.shutdown()
 
 app = FastAPI(lifespan=lifespan)
-
 
 # --- Webhook Endpoint ---
 @app.post("/webhook")
