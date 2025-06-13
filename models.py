@@ -13,7 +13,6 @@ class User(Base):
     cumulative_deposit = Column(Numeric(15, 2), nullable=False, server_default=text('0.00'))
     created_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=text('now()'))
 
-    # --- THIS IS THE MISSING LINE ---
     transactions = relationship("Transaction", back_populates="user")
 
 
@@ -28,8 +27,12 @@ class Transaction(Base):
     status = Column(String(50), nullable=False, server_default='pending')
     admin_id = Column(BigInteger, nullable=True)
     rejection_reason = Column(Text, nullable=True)
+    
+    # --- NEW FIELDS TO LOCATE THE ADMIN MESSAGE ---
+    admin_chat_id = Column(BigInteger, nullable=True)
+    admin_message_id = Column(Integer, nullable=True)
+
     created_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=text('now()'))
     updated_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=text('now()'))
 
-    # This line connects back to the User model
     user = relationship("User", back_populates="transactions")

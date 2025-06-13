@@ -14,7 +14,7 @@ from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker, selectinload
 from sqlalchemy.future import select
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ForceReply
 from telegram.constants import ChatType
 from telegram.ext import (
     Application,
@@ -26,7 +26,7 @@ from telegram.ext import (
     filters,
 )
 
-# --- Import our model and base ---
+# Import our model and base
 from database import Base
 from models import User, Transaction
 
@@ -47,7 +47,7 @@ if not DATABASE_URL or not TELEGRAM_BOT_TOKEN or not PUBLIC_URL:
 
 
 # --- Conversation States ---
-ASKING_ID, ASKING_AMOUNT, ASKING_SCREENSHOT = range(3)
+ASKING_ID, ASKING_AMOUNT, ASKING_SCREENSHOT, AWAITING_REASON = range(4)
 
 
 # --- Utility Functions ---
@@ -106,14 +106,6 @@ async def receive_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE)
     user = update.effective_user
     request_id = generate_request_id()
 
-    async with context.bot_data["db_session_factory"]() as session:
-        new_transaction = Transaction(
-            user_id=user.id, request_id=request_id, type='DEPOSIT',
-            amount=float(context.user_data.get('amount', 0)), status='pending'
-        )
-        session.add(new_transaction)
-        await session.commit()
-    
     admin_caption = (
         f"--- <b>New Deposit Request</b> ---\n"
         f"<b>Request ID:</b> <code>{request_id}</code>\n<b>User:</b> {user.mention_html()} ({user.id})\n"
@@ -123,10 +115,20 @@ async def receive_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE)
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     if ADMIN_DEPOSIT_GROUP_ID:
-        await context.bot.send_photo(
+        admin_message = await context.bot.send_photo(
             chat_id=ADMIN_DEPOSIT_GROUP_ID, photo=photo_file_id,
             caption=admin_caption, parse_mode='HTML', reply_markup=reply_markup
         )
+        # Save the transaction with the admin message details
+        async with context.bot_data["db_session_factory"]() as session:
+            new_transaction = Transaction(
+                user_id=user.id, request_id=request_id, type='DEPOSIT',
+                amount=float(context.user_data.get('amount', 0)), status='pending',
+                admin_chat_id=admin_message.chat_id, admin_message_id=admin_message.message_id
+            )
+            session.add(new_transaction)
+            await session.commit()
+
     await update.message.reply_text("Thank you! Your request has been submitted.")
     context.user_data.clear()
     return ConversationHandler.END
@@ -137,7 +139,6 @@ async def lock_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     query = update.callback_query
     request_id = query.data.split(":")[1]
     admin = query.from_user
-
     async with context.bot_data["db_session_factory"]() as session:
         result = await session.execute(select(Transaction).filter_by(request_id=request_id))
         transaction = result.scalar_one_or_none()
@@ -180,26 +181,65 @@ async def approve_request(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         else:
             await query.answer("You cannot approve this request.", show_alert=True)
 
-async def reject_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def reject_request_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """UPDATED: Starts the rejection process by asking for a reason."""
     query = update.callback_query
     request_id = query.data.split(":")[1]
-    admin = query.from_user
+    admin_id = query.from_user.id
+    
+    # Store the request_id for the next step
+    context.user_data['rejection_request_id'] = request_id
+    
+    await query.answer("Please provide a reason.")
+    await context.bot.send_message(
+        chat_id=admin_id,
+        text=f"You are rejecting request <code>{request_id}</code>.\nPlease reply to this message with the reason for rejection.",
+        parse_mode='HTML',
+        reply_markup=ForceReply(selective=True)
+    )
+    return AWAITING_REASON
+
+async def receive_rejection_reason(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """NEW: Finishes the rejection process after receiving the reason."""
+    rejection_reason = update.message.text
+    request_id = context.user_data.pop('rejection_request_id', None)
+    admin = update.effective_user
+
+    if not request_id:
+        return ConversationHandler.END
+
     async with context.bot_data["db_session_factory"]() as session:
         result = await session.execute(select(Transaction).filter_by(request_id=request_id))
         transaction = result.scalar_one_or_none()
+        
         if transaction and transaction.status == 'locked' and transaction.admin_id == admin.id:
-            await query.answer("Request Rejected.")
             transaction.status = 'rejected'
+            transaction.rejection_reason = rejection_reason
             await session.commit()
+
+            # Notify the user with the reason
             await context.bot.send_message(
                 chat_id=transaction.user_id,
-                text=f"❌ Your deposit request (ID: {request_id}) for {transaction.amount} MMK has been rejected. Please contact support."
+                text=f"❌ Your deposit request (ID: {request_id}) has been rejected.\n<b>Reason:</b> {rejection_reason}",
+                parse_mode='HTML'
             )
-            original_caption = re.sub(r'\n\n---\n.*', '', query.message.caption_html, flags=re.DOTALL)
-            new_caption = f"{original_caption}\n\n---\n<b>Status:</b> ❌ Rejected by {admin.mention_html()}"
-            await query.edit_message_caption(caption=new_caption, parse_mode='HTML', reply_markup=None)
+            
+            await update.message.reply_text("Rejection processed. The user has been notified.")
+            
+            # Update the admin message
+            original_caption = re.sub(r'\n\n---\n.*', '', transaction.admin_message_id, flags=re.DOTALL)
+            new_caption = f"{original_caption}\n\n---\n<b>Status:</b> ❌ Rejected by {admin.mention_html()}\n<b>Reason:</b> {rejection_reason}"
+            await context.bot.edit_message_caption(
+                chat_id=transaction.admin_chat_id,
+                message_id=transaction.admin_message_id,
+                caption=new_caption,
+                parse_mode='HTML',
+                reply_markup=None
+            )
         else:
-            await query.answer("You cannot reject this request.", show_alert=True)
+            await update.message.reply_text("Could not process rejection. The request may have already been handled.")
+    
+    return ConversationHandler.END
 
 
 # --- FastAPI & Application Setup ---
@@ -214,24 +254,30 @@ async def lifespan(app: FastAPI):
     ptb_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     ptb_app.bot_data["db_session_factory"] = db_session_factory
 
-    # Use the library's built-in filter for private chats
-    private_filter = filters.ChatType.PRIVATE
+    # Create a new conversation handler just for the rejection reason
+    rejection_handler = ConversationHandler(
+        entry_points=[CallbackQueryHandler(reject_request_start, pattern=r"^reject_req:")],
+        states={
+            AWAITING_REASON: [MessageHandler(filters.REPLY & filters.TEXT & ~filters.COMMAND, receive_rejection_reason)]
+        },
+        fallbacks=[CommandHandler('cancel', cancel)]
+    )
 
     deposit_conv_handler = ConversationHandler(
         entry_points=[CallbackQueryHandler(deposit_start, pattern="^deposit_start$")],
         states={
-            ASKING_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND & private_filter, receive_xbet_id)],
-            ASKING_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND & private_filter, receive_amount)],
-            ASKING_SCREENSHOT: [MessageHandler(filters.PHOTO & private_filter, receive_screenshot)],
+            ASKING_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_xbet_id)],
+            ASKING_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_amount)],
+            ASKING_SCREENSHOT: [MessageHandler(filters.PHOTO, receive_screenshot)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
         per_message=False
     )
-    ptb_app.add_handler(CommandHandler("start", start, filters=private_filter))
+    ptb_app.add_handler(CommandHandler("start", start, filters=filters.ChatType.PRIVATE))
     ptb_app.add_handler(deposit_conv_handler)
     ptb_app.add_handler(CallbackQueryHandler(lock_request, pattern=r"^lock_req:"))
     ptb_app.add_handler(CallbackQueryHandler(approve_request, pattern=r"^approve_req:"))
-    ptb_app.add_handler(CallbackQueryHandler(reject_request, pattern=r"^reject_req:"))
+    ptb_app.add_handler(rejection_handler) # Add the new rejection handler
     
     app.state.ptb_app = ptb_app
     await ptb_app.initialize()
