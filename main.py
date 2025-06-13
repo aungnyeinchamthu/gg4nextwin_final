@@ -3,6 +3,7 @@ import logging
 import html
 import random
 import string
+import re
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, Response
@@ -10,7 +11,7 @@ import uvicorn
 import json
 
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import sessionmaker, selectinload
 from sqlalchemy.future import select
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -55,7 +56,6 @@ def generate_request_id(prefix='DEP-', length=6):
 
 # --- Main Handlers ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Sends a welcome message with a Deposit button."""
     user = update.effective_user
     async with context.bot_data["db_session_factory"]() as session:
         result = await session.execute(select(User).filter_by(user_id=user.id))
@@ -72,7 +72,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Cancels and ends the conversation."""
     await update.message.reply_text("Operation cancelled.")
     context.user_data.clear()
     return ConversationHandler.END
@@ -107,25 +106,18 @@ async def receive_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE)
     user = update.effective_user
     request_id = generate_request_id()
 
-    # Save the transaction to the database
     async with context.bot_data["db_session_factory"]() as session:
         new_transaction = Transaction(
-            user_id=user.id,
-            request_id=request_id,
-            type='DEPOSIT',
-            amount=float(context.user_data.get('amount', 0)),
-            status='pending'
+            user_id=user.id, request_id=request_id, type='DEPOSIT',
+            amount=float(context.user_data.get('amount', 0)), status='pending'
         )
         session.add(new_transaction)
         await session.commit()
-        logger.info(f"Saved new transaction {request_id} to database.")
-
+    
     admin_caption = (
         f"--- <b>New Deposit Request</b> ---\n"
-        f"<b>Request ID:</b> <code>{request_id}</code>\n"
-        f"<b>User:</b> {user.mention_html()} ({user.id})\n"
-        f"<b>1xBet ID:</b> {context.user_data.get('xbet_id', 'N/A')}\n"
-        f"<b>Amount:</b> {context.user_data.get('amount', 'N/A')} MMK"
+        f"<b>Request ID:</b> <code>{request_id}</code>\n<b>User:</b> {user.mention_html()} ({user.id})\n"
+        f"<b>1xBet ID:</b> {context.user_data.get('xbet_id', 'N/A')}\n<b>Amount:</b> {context.user_data.get('amount', 'N/A')} MMK"
     )
     keyboard = [[InlineKeyboardButton("🔒 Lock & Take", callback_data=f"lock_req:{request_id}")]]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -136,52 +128,94 @@ async def receive_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE)
             caption=admin_caption, parse_mode='HTML', reply_markup=reply_markup
         )
     await update.message.reply_text("Thank you! Your request has been submitted.")
-
     context.user_data.clear()
     return ConversationHandler.END
 
 
-# --- NEW: Admin Action Handler ---
+# --- Admin Action Handlers ---
 async def lock_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handles the 'Lock & Take' button click by an admin."""
     query = update.callback_query
-    await query.answer("Request locked by you.")
-
-    # Extract request_id from callback_data (e.g., "lock_req:DEP-XYZ123")
     request_id = query.data.split(":")[1]
     admin = query.from_user
 
     async with context.bot_data["db_session_factory"]() as session:
         result = await session.execute(select(Transaction).filter_by(request_id=request_id))
         transaction = result.scalar_one_or_none()
-
         if transaction and transaction.status == 'pending':
+            await query.answer("Request locked by you.")
             transaction.status = 'locked'
             transaction.admin_id = admin.id
             await session.commit()
-            logger.info(f"Transaction {request_id} locked by admin {admin.username} ({admin.id}).")
-
-            # Create new buttons for Approve/Reject
-            keyboard = [
-                [
-                    InlineKeyboardButton("✅ Approve", callback_data=f"approve_req:{request_id}"),
-                    InlineKeyboardButton("❌ Reject", callback_data=f"reject_req:{request_id}")
-                ]
-            ]
+            keyboard = [[
+                InlineKeyboardButton("✅ Approve", callback_data=f"approve_req:{request_id}"),
+                InlineKeyboardButton("❌ Reject", callback_data=f"reject_req:{request_id}")
+            ]]
             reply_markup = InlineKeyboardMarkup(keyboard)
-
-            # Edit the original message caption to show it's locked
             original_caption = query.message.caption_html
             new_caption = f"{original_caption}\n\n---\n<b>Status:</b> Locked by {admin.mention_html()}"
-            
             await query.edit_message_caption(caption=new_caption, parse_mode='HTML', reply_markup=reply_markup)
-        
-        elif transaction:
-            # If another admin already took it
-            await query.answer(f"This request was already handled (Status: {transaction.status}).", show_alert=True)
         else:
-            await query.answer("Error: Transaction not found in database.", show_alert=True)
-            logger.warning(f"Admin {admin.id} tried to lock non-existent transaction {request_id}")
+            await query.answer("This request was already handled.", show_alert=True)
+
+async def approve_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handles the 'Approve' button click."""
+    query = update.callback_query
+    request_id = query.data.split(":")[1]
+    admin = query.from_user
+
+    async with context.bot_data["db_session_factory"]() as session:
+        # Use selectinload to fetch the related user at the same time
+        result = await session.execute(
+            select(Transaction).options(selectinload(Transaction.user)).filter_by(request_id=request_id)
+        )
+        transaction = result.scalar_one_or_none()
+
+        if transaction and transaction.status == 'locked' and transaction.admin_id == admin.id:
+            await query.answer("Request Approved.")
+            transaction.status = 'approved'
+            # Here you would add logic to calculate and add points to transaction.user
+            await session.commit()
+
+            # Notify the user
+            await context.bot.send_message(
+                chat_id=transaction.user_id,
+                text=f"✅ Your deposit request (ID: {request_id}) for {transaction.amount} MMK has been approved."
+            )
+            
+            # Update the admin message to its final state
+            original_caption = re.sub(r'\n\n---\n.*', '', query.message.caption_html, flags=re.DOTALL)
+            new_caption = f"{original_caption}\n\n---\n<b>Status:</b> ✅ Approved by {admin.mention_html()}"
+            await query.edit_message_caption(caption=new_caption, parse_mode='HTML', reply_markup=None) # No more buttons
+        else:
+            await query.answer("You cannot approve this request.", show_alert=True)
+
+async def reject_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handles the 'Reject' button click."""
+    query = update.callback_query
+    request_id = query.data.split(":")[1]
+    admin = query.from_user
+    
+    async with context.bot_data["db_session_factory"]() as session:
+        result = await session.execute(select(Transaction).filter_by(request_id=request_id))
+        transaction = result.scalar_one_or_none()
+
+        if transaction and transaction.status == 'locked' and transaction.admin_id == admin.id:
+            await query.answer("Request Rejected.")
+            transaction.status = 'rejected'
+            await session.commit()
+
+            # Notify the user
+            await context.bot.send_message(
+                chat_id=transaction.user_id,
+                text=f"❌ Your deposit request (ID: {request_id}) for {transaction.amount} MMK has been rejected. Please contact support."
+            )
+            
+            # Update the admin message to its final state
+            original_caption = re.sub(r'\n\n---\n.*', '', query.message.caption_html, flags=re.DOTALL)
+            new_caption = f"{original_caption}\n\n---\n<b>Status:</b> ❌ Rejected by {admin.mention_html()}"
+            await query.edit_message_caption(caption=new_caption, parse_mode='HTML', reply_markup=None) # No more buttons
+        else:
+            await query.answer("You cannot reject this request.", show_alert=True)
 
 
 # --- FastAPI & Application Setup ---
@@ -213,8 +247,10 @@ async def lifespan(app: FastAPI):
     )
     ptb_app.add_handler(CommandHandler("start", start))
     ptb_app.add_handler(deposit_conv_handler)
-    # NEW: Add the handler for the admin lock button
+    # Add all admin action handlers
     ptb_app.add_handler(CallbackQueryHandler(lock_request, pattern=r"^lock_req:"))
+    ptb_app.add_handler(CallbackQueryHandler(approve_request, pattern=r"^approve_req:"))
+    ptb_app.add_handler(CallbackQueryHandler(reject_request, pattern=r"^reject_req:"))
     
     app.state.ptb_app = ptb_app
 
@@ -241,4 +277,4 @@ async def process_telegram_update(request: Request):
 
 @app.get("/")
 async def health_check():
-    return {"status": "ok", "message": "Full deposit feature active."}
+    return {"status": "ok", "message": "Full admin workflow active."}
